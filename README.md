@@ -26,14 +26,30 @@
 - **.NET 9 SDK** — only if you want to run the backend outside Docker
 - **Git** — to clone the repo
 
+### Install Docker (one-time)
+
+| OS      | Command                                                                  |
+|---------|--------------------------------------------------------------------------|
+| Windows | `winget install -e --id Docker.DockerDesktop` *(requires WSL 2: `wsl --install`)* |
+| macOS   | `brew install --cask docker`                                             |
+| Linux   | `curl -fsSL https://get.docker.com \| sudo sh && sudo usermod -aG docker $USER` |
+
+Verify:
+
+```bash
+docker --version
+docker compose version
+docker run hello-world
+```
+
 ---
 
 ## Option 1 — Docker Compose (Recommended)
 
-This spins up **MySQL + Elasticsearch + Backend** in one command.
+This spins up **MySQL + Elasticsearch + Backend + Frontend** in one command.
 
 ```bash
-cd C:\Users\Lokesh Sharma\Self_learning\ConverzAI
+# From the repo root (wherever you cloned it)
 docker-compose up --build
 ```
 
@@ -95,15 +111,44 @@ Swagger UI: **https://localhost:{port}/swagger**
 
 ---
 
+## Assignment Spec — What Was Asked vs. What Was Built
+
+The ConverzAI take-home spec asked for a small product catalog API with the following 5 routes. Every row below maps **spec → shipped**:
+
+| # | Spec requirement (verbatim)              | Shipped route                                | Backend        | Status |
+|---|------------------------------------------|----------------------------------------------|----------------|--------|
+| 1 | `GET /categories`                        | `GET /api/products/categories`               | MySQL DISTINCT | ✅      |
+| 2 | `GET /products` (list all, paginated)    | `GET /api/products?page=1&size=20`           | MySQL          | ✅      |
+| 3 | `GET /products/{id}` (detail)            | `GET /api/products/{id}`                     | MySQL          | ✅      |
+| 4 | `GET /products?query={query}` (search)   | `GET /api/products?query=mascara`            | Elasticsearch  | ✅      |
+| 5 | `GET /products?category={category}`      | `GET /api/products?category=beauty`          | MySQL          | ✅      |
+
+**Extras beyond the spec** (kept small on purpose):
+- `GET /api/products/search?q=...` — backward-compat alias for `?query=`.
+- `GET /healthz` — liveness probe used by the Docker healthcheck.
+- Swagger UI at `http://localhost:5000/swagger` for interactive exploration.
+
+**Other spec items (non-routing):**
+- ✅ Seed the DB from [dummyjson.com/products](https://dummyjson.com/products) (194 products, done once on first boot via `DataSeeder`).
+- ✅ Use a relational DB → **MySQL 8**.
+- ✅ Use a search engine for text queries → **Elasticsearch 7.17** (index rebuilt from MySQL on startup).
+- ✅ Clean separation of concerns → Clean Architecture (Api / Application / Domain / Infrastructure).
+- ✅ Dockerized end-to-end → `docker compose up` boots MySQL + ES + backend + frontend.
+- ✅ A minimal frontend to demo the API → Vanilla HTML/JS served by Nginx on port 3000.
+
+---
+
 ## API Endpoints
 
 All endpoints return JSON. Base URL: `http://localhost:5000` (direct) or `http://localhost:3000/api` (via Nginx proxy).
 
 | Method | Route                                                  | Backend used      | Purpose                                      |
 |--------|--------------------------------------------------------|-------------------|----------------------------------------------|
-| GET    | `/api/products?page=1&size=20&category=beauty`         | MySQL             | Paginated browse, optional category filter   |
+| GET    | `/api/products?page=1&size=20`                         | MySQL             | Paginated browse                             |
+| GET    | `/api/products?category=beauty`                        | MySQL             | Filter by category                           |
+| GET    | `/api/products?query=mascara`                          | Elasticsearch     | Full-text search (spec-matched route)        |
 | GET    | `/api/products/{id}`                                   | MySQL             | Full product detail incl. images, reviews    |
-| GET    | `/api/products/search?q=mascara&category=beauty&page=1`| Elasticsearch     | Full-text search with fuzziness + boosting   |
+| GET    | `/api/products/search?q=mascara&category=beauty`       | Elasticsearch     | Alias for `?query=` (kept for backward compat) |
 | GET    | `/api/products/categories`                             | MySQL (DISTINCT)  | List all distinct categories (for filters)   |
 
 ### Examples
@@ -115,12 +160,12 @@ curl "http://localhost:5000/api/products?page=1&size=20"
 # 2. Filter by category (no text query → MySQL)
 curl "http://localhost:5000/api/products?category=beauty"
 
-# 3. Full-text search with typo tolerance (goes to Elasticsearch)
-curl "http://localhost:5000/api/products/search?q=mascara"
+# 3. Full-text search via ?query= (spec route → Elasticsearch)
+curl "http://localhost:5000/api/products?query=mascara"
 # → returns "Essence Mascara Lash Princess" even for misspellings like "mascra"
 
 # 4. Search + filter combined
-curl "http://localhost:5000/api/products/search?q=phone&category=smartphones&size=5"
+curl "http://localhost:5000/api/products?query=phone&category=smartphones&size=5"
 
 # 5. Get product detail
 curl "http://localhost:5000/api/products/1"
@@ -131,8 +176,8 @@ curl "http://localhost:5000/api/products/categories"
 ```
 
 **Which strategy runs?** The `ProductService` loops through `IEnumerable<ISearchStrategy>` and picks the first one whose `CanHandle(request)` returns `true`:
-- `q` is **empty** → `MySqlSearchStrategy` wins (cheap EF Core query).
-- `q` is **present** → `ElasticSearchStrategy` wins (NEST `MultiMatch` with `Fuzziness.Auto`, boosts: `title×3`, `tags×2`, `brand×2`, `category×1.5`).
+- `query` is **empty** → `MySqlSearchStrategy` wins (cheap EF Core query, honours `category` filter).
+- `query` is **present** → `ElasticSearchStrategy` wins (NEST `MultiMatch` with `Fuzziness.Auto`, boosts: `title×3`, `tags×2`, `brand×2`, `category×1.5`).
 
 ---
 
@@ -348,41 +393,4 @@ Short, pragmatic rationale for the non-obvious choices — the "why" interviewer
 | 2 | **Strategy Pattern for search** (`ISearchStrategy` list, first `CanHandle` wins) | Swapping/adding a backend (e.g., OpenSearch, vector DB) means adding one class — no `if/else` in the service. | Slightly more indirection than a `switch` statement. |
 | 3 | **MySQL is source of truth; ES is a projection** | ES index is rebuilt from MySQL on startup (`BulkIndexAllAsync`). If ES dies, we re-seed and continue. | First boot is slower; no incremental sync yet (future: outbox + background reindex). |
 | 4 | **Pomelo over MySql.Data EF provider** | Actively maintained, handles MySQL 8 auth + timezone quirks. | Pomelo **does not support `.ToJson()`** — so `Dimensions` & `Meta` use flat owned columns instead of JSON. Acceptable; queryable too. |
-| 5 | **Fixed `MySqlServerVersion(8,0,36)` instead of `AutoDetect`** | `AutoDetect` requires a live DB at migration-generation time → breaks `dotnet ef migrations add` in CI. | Must bump the version manually if MySQL is upgraded. |
-| 6 | **`Swashbuckle.AspNetCore` pinned at 7.2.0** | 10.x has a broken `Microsoft.OpenApi` dep chain → `ReflectionTypeLoadException` at runtime. | Stuck on older OpenAPI surface until upstream fixes it. |
-| 7 | **Nginx reverse-proxy in the frontend container** (`/api/ → backend:8080`) | Frontend and API share an origin (`:3000`), so **no CORS setup** needed in the backend. | One more container to run. Trivial vs. debugging CORS preflights. |
-| 8 | **Healthcheck-gated `depends_on`** in Compose | Backend waits for MySQL + ES to actually be **healthy**, not just "started" — no retry loop needed in code. | Startup feels slow (~30s cold) but is deterministic. |
-| 9 | **`MYSQL_ROOT_HOST: '%'`** env on MySQL service | MySQL 8 defaults to `root@localhost` only — backend in another container would get `Host 'x.x.x.x' is not allowed`. | Root is now accessible from any host on the compose network. Fine for dev; production uses a dedicated app user. |
-| 10 | **Seeder is idempotent** (skips if `Products.Count > 0`) | Safe to restart the stack; `docker compose up` repeatedly won't duplicate data. | Forces `down -v` for a true reset. |
-| 11 | **DTOs via C# `record` types + hand-rolled `ProductMappings`** | Zero reflection, zero AutoMapper config surprises, fastest JSON serialization. | Manual mapping boilerplate. Acceptable for this size. |
-| 12 | **Dumb frontend (vanilla JS, 300ms debounce)** | Keeps demo easy to explain and removes Node/build toolchain from the critical path. | No SPA niceties (routing, state management). Could swap in React any time — API is unchanged. |
-
-**Things deliberately left out** (would add next):
-- `/healthz` endpoint + container healthcheck for the backend itself
-- Global exception handler (`IExceptionHandler`) → consistent Problem+JSON responses
-- Outbox pattern for MySQL→ES sync (today it's full reindex on startup)
-- Integration tests against a Testcontainers MySQL + ES
-- GitHub Actions CI (build + push images)
-
----
-
-## Environment Variables (Docker Compose overrides)
-
-| Variable                  | Default (in docker-compose)                                        |
-|---------------------------|--------------------------------------------------------------------|
-| `ConnectionStrings__MySql`| `server=mysql;port=3306;database=ecommerce;user=root;password=dev` |
-| `Elasticsearch__Uri`      | `http://elasticsearch:9200`                                        |
-| `Elasticsearch__Index`    | `products`                                                         |
-
----
-
-## Troubleshooting
-
-| Problem                                                  | Fix                                                              |
-|----------------------------------------------------------|------------------------------------------------------------------|
-| Port 3306 / 5000 / 9200 / 3000 already in use            | Stop the conflicting local service or remap the port in `docker-compose.yml` |
-| `Host 'x.x.x.x' is not allowed to connect to MySQL`      | Ensure `MYSQL_ROOT_HOST: '%'` is set on the `mysql` service (MySQL 8 restricts root to `localhost` by default) |
-| Backend exits immediately on `docker compose up`         | Check `docker compose logs backend` — usually MySQL not yet healthy; compose waits via `depends_on: condition: service_healthy` |
-| `dotnet ef` not found                                    | Install: `dotnet tool install --global dotnet-ef`                |
-| Elasticsearch container exits / OOM                      | Increase Docker Desktop memory to ≥ 4 GB                         |
-| Swagger 500 / `ReflectionTypeLoadException`              | Keep `Swashbuckle.AspNetCore` pinned to **7.2.0** — 10.x has a broken `Microsoft.OpenApi` dependency chain |
+| 5 | **Fixed `MySqlServerVersion(8,0,36)` instead of `AutoDetect`** | `AutoDetect` requires a live DB at migration-generation time → breaks `dotnet ef migrations add` in CI. | Must bump the vers

@@ -16,16 +16,18 @@ public class ProductsController : ControllerBase
         _service = service;
     }
 
-    // GET /api/products?page=1&size=20&category=beauty
+    // GET /api/products?page=1&size=20&category=beauty&query=phone
+    // Matches spec: /products?query={query} → ES full-text, /products?category={c} → MySQL filter
     [HttpGet]
     public async Task<ActionResult<IReadOnlyList<ProductListItemDto>>> List(
         [FromQuery] int page = 1,
         [FromQuery] int size = 20,
         [FromQuery] string? category = null,
+        [FromQuery] string? query = null,
         CancellationToken ct = default)
     {
         (page, size) = Clamp(page, size);
-        var req = new SearchRequest(Query: null, Category: category, Page: page, Size: size);
+        var req = new SearchRequest(Query: query, Category: category, Page: page, Size: size);
         var items = await _service.SearchAsync(req, ct);
         return Ok(items);
     }
@@ -69,3 +71,5 @@ public class ProductsController : ControllerBase
         return (page, size);
     }
 }
+
+
